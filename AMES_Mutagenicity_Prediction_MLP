@@ -1,0 +1,186 @@
+import os
+import sys
+
+# Install key missing dependencies for PyTDC to work without failing its import
+!pip install fuzzywuzzy python-Levenshtein
+
+tdc_path = '/content/drive/MyDrive/Hakase AI/Ames test/2/TDC-main'
+
+if os.path.exists(tdc_path):
+    print("TDC directory found. Adding it to system path...")
+    if tdc_path not in sys.path:
+        sys.path.insert(0, tdc_path)
+    
+    try:
+        # Import local tdc source directly
+        from tdc.single_pred import Tox
+        print("Successfully imported TDC library locally!")
+        
+        # Retrieve the Ames Mutagenicity dataset using the local library
+        data = Tox(name='Ames')
+        df = data.get_data()
+        
+        display(df.head())
+        print(f"Dataset shape: {df.shape}")
+    except Exception as e:
+        print(f"Could not load dataset via local import: {e}")
+else:
+    print(f"Could not find TDC folder at: {tdc_path}")
+
+
+import os
+import sys
+import pandas as pd
+import numpy as np
+
+# 1. Add target path to system path
+target_path = '/content/drive/MyDrive/Hakase AI/Ames test/1'
+if os.path.exists(target_path):
+    print(f"Target directory '{target_path}' found! Adding to system path...")
+    if target_path not in sys.path:
+        sys.path.insert(0, target_path)
+else:
+    print(f"Warning: '{target_path}' path was not found.")
+
+# 2. Re-import libraries
+import deepchem as dc
+import torch
+import torch.nn as nn
+
+# Ensure dataset is available
+if 'df' in globals() and not df.empty:
+    df_clean = df.dropna(subset=['Drug', 'Y']).reset_index(drop=True)
+    print(f"Using preloaded clean dataset with {len(df_clean)} molecules.")
+else:
+    print("Error: Dataset 'df' is not loaded or is empty in global variables.")
+
+# 3. Use Fingerprints and PyTorch Multi-Layer Perceptron
+print("Featurizing molecules using CircularFingerprints (Morgan fingerprints)...")
+featurizer = dc.feat.CircularFingerprint(size=2048, radius=2)
+X = featurizer.featurize(df_clean['Drug'].tolist())
+y = df_clean['Y'].values
+
+# Filter out any failed featurizations (which output an empty array or None)
+valid_indices = [i for i, x in enumerate(X) if x is not None and len(x) > 0]
+X_valid = np.array([X[i] for i in valid_indices])
+y_valid = y[valid_indices].reshape(-1, 1)
+print(f"Featurization complete. Valid molecules: {len(X_valid)} / {len(X)}")
+
+# Create a DeepChem NumpyDataset
+dataset = dc.data.NumpyDataset(X=X_valid, y=y_valid)
+
+# Split dataset into train, validation, and test sets using clean integer indices
+splitter = dc.splits.RandomSplitter()
+train_dataset, valid_dataset, test_dataset = splitter.train_valid_test_split(
+    dataset, frac_train=0.8, frac_valid=0.1, frac_test=0.1
+)
+
+# 4. Define PyTorch Neural Network with Softmax to output probability matrix for evaluation
+class PyTorchMLP(nn.Module):
+    def __init__(self):
+        super(PyTorchMLP, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(2048, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 2),  # Output logits for two classes
+            nn.Softmax(dim=1)   # Ensure predictions sum to 1
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+torch_model = PyTorchMLP()
+
+# Wrap in DeepChem's TorchModel
+model = dc.models.TorchModel(
+    torch_model,
+    loss=dc.models.losses.SparseSoftmaxCrossEntropy(),
+    output_types=['prediction'],
+    batch_size=32
+)
+
+# Fit the model
+print("Training PyTorch Neural Network...")
+loss = model.fit(train_dataset, nb_epoch=20)
+print(f"Final training loss: {loss:.4f}")
+
+# 5. Evaluate the model performance
+metrics = [
+    dc.metrics.Metric(dc.metrics.roc_auc_score, np.mean),
+    dc.metrics.Metric(dc.metrics.accuracy_score, np.mean)
+]
+
+train_scores = model.evaluate(train_dataset, metrics)
+valid_scores = model.evaluate(valid_dataset, metrics)
+test_scores = model.evaluate(test_dataset, metrics)
+
+print("\n--- Model Performance ---")
+print(f"Train Scores: {train_scores}")
+print(f"Validation Scores: {valid_scores}")
+print(f"Test Scores: {test_scores}")
+
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+
+# 1. Get predicted probabilities on validation and test sets
+# Note: model.predict outputs predictions of shape (N, 2) since we used Softmax(dim=1)
+# The second column [:, 1] represents the probability of the active class (1)
+val_preds = model.predict(valid_dataset)[:, 1]
+test_preds = model.predict(test_dataset)[:, 1]
+
+# 2. Extract true labels
+y_val_true = valid_dataset.y
+y_test_true = test_dataset.y
+
+# 3. Compute ROC curve metrics
+fpr_val, tpr_val, _ = roc_curve(y_val_true, val_preds)
+roc_auc_val = auc(fpr_val, tpr_val)
+
+fpr_test, tpr_test, _ = roc_curve(y_test_true, test_preds)
+roc_auc_test = auc(fpr_test, tpr_test)
+
+# 4. Plot the curves
+plt.figure(figsize=(8, 6))
+plt.plot(fpr_val, tpr_val, color='darkorange', lw=2, label=f'Validation ROC (AUC = {roc_auc_val:.4f})')
+plt.plot(fpr_test, tpr_test, color='blue', lw=2, label=f'Test ROC (AUC = {roc_auc_test:.4f})')
+plt.plot([0, 1], [0, 1], color='grey', lw=2, linestyle='--', label='Random Guess')
+
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curves')
+plt.legend(loc="lower right")
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.show()
+
+
+import pandas as pd
+
+# Construct a DataFrame with the evaluated metric scores
+performance_data = {
+    'Dataset Split': ['Train', 'Validation', 'Test'],
+    'ROC-AUC Score': [
+        train_scores['mean-roc_auc_score'],
+        valid_scores['mean-roc_auc_score'],
+        test_scores['mean-roc_auc_score']
+    ],
+    'Accuracy': [
+        train_scores['mean-accuracy_score'],
+        valid_scores['mean-accuracy_score'],
+        test_scores['mean-accuracy_score']
+    ]
+}
+
+df_performance = pd.DataFrame(performance_data)
+
+# Format scores as percentage and decimals for readability
+df_performance['ROC-AUC Score'] = df_performance['ROC-AUC Score'].map('{:.4f}'.format)
+df_performance['Accuracy'] = df_performance['Accuracy'].map('{:.2%}'.format)
+
+display(df_performance)
